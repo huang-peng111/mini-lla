@@ -1,0 +1,5 @@
+#include <exception>
+#include <iostream>
+int test_tensor();
+int test_ops();
+int main(){try{if(test_tensor()!=0||test_ops()!=0)return 1;}catch(const std::exception&e){std::cerr<<"test failure: "<<e.what()<<"\n";return 1;}std::cout<<"mini-lla tensor/op tests passed\n";return 0;}

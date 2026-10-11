@@ -1,0 +1,41 @@
+# CMake build directories and generated files
+build/
+build-*/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+CTestTestfile.cmake
+cmake_install.cmake
+Makefile
+compile_commands.json
+*.sln
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
+
+# Compiled binaries and libraries
+*.exe
+*.dll
+*.pdb
+*.lib
+*.obj
+*.o
+*.a
+
+# IDE and editor files
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Local logs and temporary files
+*.log
+*.tmp
+*.swp
+Thumbs.db
+Desktop.ini
