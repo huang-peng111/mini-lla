@@ -1,0 +1,8 @@
+BasedOnStyle: Google
+Language: Cpp
+ColumnLimit: 80
+IndentWidth: 2
+ContinuationIndentWidth: 4
+AccessModifierOffset: -1
+AllowShortFunctionsOnASingleLine: Empty
+BreakBeforeBraces: Attach

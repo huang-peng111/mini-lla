@@ -7,9 +7,8 @@ namespace mini_lla {
 static size_t ElementCount(const std::vector<int>& shape) {
   size_t count = 1;
   for (int dimension : shape) {
-    if (dimension <= 0 ||
-        count > std::numeric_limits<size_t>::max() /
-                       static_cast<size_t>(dimension)) {
+    if (dimension <= 0 || count > std::numeric_limits<size_t>::max() /
+                                      static_cast<size_t>(dimension)) {
       throw std::invalid_argument("invalid tensor shape");
     }
     count *= static_cast<size_t>(dimension);
@@ -17,6 +16,7 @@ static size_t ElementCount(const std::vector<int>& shape) {
   return count;
 }
 
+// 按形状分配连续的 F32 存储。
 Tensor::Tensor(std::vector<int> input_shape, float fill)
     : shape(std::move(input_shape)), data(ElementCount(shape), fill) {}
 
@@ -35,6 +35,7 @@ size_t Tensor::index(const std::vector<int>& indices) const {
   return flat_index;
 }
 
+// 创建同一数据数量的新形状张量。
 Tensor Tensor::reshape(std::vector<int> new_shape) const {
   if (ElementCount(new_shape) != data.size()) {
     throw std::invalid_argument("reshape changes element count");
@@ -45,6 +46,7 @@ Tensor Tensor::reshape(std::vector<int> new_shape) const {
   return result;
 }
 
+// 将形状格式化为日志可读的文本。
 std::string Tensor::shape_string() const {
   std::ostringstream output;
   output << "[";
@@ -55,4 +57,4 @@ std::string Tensor::shape_string() const {
   output << "]";
   return output.str();
 }
-}
+}  // namespace mini_lla

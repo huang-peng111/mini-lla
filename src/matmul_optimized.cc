@@ -1,5 +1,6 @@
-#include "mini_llama/matmul_dispatch.h"
 #include <stdexcept>
+
+#include "mini_llama/matmul_dispatch.h"
 namespace mini_lla {
 static MatmulMode g_mode = MatmulMode::kOptimized;
 
@@ -9,6 +10,7 @@ static void CheckShapes(const Tensor& a, const Tensor& b) {
   }
 }
 
+// 朴素三重循环版本，用作正确性参考。
 Tensor matmul_naive(const Tensor& a, const Tensor& b) {
   CheckShapes(a, b);
   Tensor output({a.shape[0], b.shape[1]});
@@ -22,6 +24,7 @@ Tensor matmul_naive(const Tensor& a, const Tensor& b) {
   return output;
 }
 
+// 调整循环顺序，减少输入 A 的重复读取。
 Tensor matmul_optimized(const Tensor& a, const Tensor& b) {
   CheckShapes(a, b);
   Tensor output({a.shape[0], b.shape[1]});
@@ -37,12 +40,19 @@ Tensor matmul_optimized(const Tensor& a, const Tensor& b) {
   return output;
 }
 
+// 根据模式分派到具体矩阵乘实现。
 Tensor matmul_dispatch(const Tensor& a, const Tensor& b, MatmulMode mode) {
   return mode == MatmulMode::kNaive ? matmul_naive(a, b)
                                     : matmul_optimized(a, b);
 }
 
-void set_matmul_mode(MatmulMode mode) { g_mode = mode; }
-
-MatmulMode matmul_mode() { return g_mode; }
+// 设置全局默认矩阵乘模式。
+void set_matmul_mode(MatmulMode mode) {
+  g_mode = mode;
 }
+
+// 返回全局默认矩阵乘模式。
+MatmulMode matmul_mode() {
+  return g_mode;
+}
+}  // namespace mini_lla
