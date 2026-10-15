@@ -5,6 +5,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 add_library(mini_lla_core src/tensor.cc src/ops.cc src/matmul_optimized.cc
             src/loader.cc src/tokenizer.cc src/kv_cache.cc src/forward.cc
             src/sampler.cc src/chat.cc)
+target_sources(mini_lla_core PRIVATE src/gguf.cc src/gguf_tokenizer.cc src/quant.cc)
 target_include_directories(mini_lla_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 if(MSVC)
   target_compile_options(mini_lla_core PRIVATE /W4 /utf-8)
@@ -13,6 +14,7 @@ else()
 endif()
 add_executable(mini-lla-tests tests/test_main.cc tests/test_tensor.cc
                 tests/test_ops.cc tests/test_sampler_chat.cc)
+target_sources(mini-lla-tests PRIVATE tests/test_gguf_quant.cc)
 target_link_libraries(mini-lla-tests PRIVATE mini_lla_core)
 add_executable(mini-lla src/main.cc)
 target_link_libraries(mini-lla PRIVATE mini_lla_core)
