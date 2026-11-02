@@ -2,78 +2,138 @@
 
 #include <cmath>
 #include <stdexcept>
+#include <vector>
 
 #include "mini_llama/ops.h"
+#include "mini_llama/quant.h"
+
 namespace mini_lla {
 namespace {
-// 根据 token id 从 embedding 矩阵取出隐藏向量。
-Tensor embedding(const Model& m, int token) {
-  // embedding 是词表矩阵按 token id 取出的一行。
-  if (token < 0 || token >= m.config.vocab_size)
-    throw std::out_of_range("token id out of range");
-  Tensor x({m.config.dim});
-  for (int i = 0; i < m.config.dim; ++i)
-    x.data[i] = m.token_embedding.at2(token, i);
-  return x;
+
+// 检查 token、位置和层数是否与模型配置一致。
+void ValidateInputs(const Context& context, const Model& model, int token) {
+  if (token < 0 || token >= model.config.vocab_size) {
+    throw std::out_of_range("forward: token id out of range");
+  }
+  if (context.position < 0 || context.position >= model.config.max_seq_len) {
+    throw std::out_of_range("forward: position exceeds context length");
+  }
+  if (model.layers.size() != static_cast<size_t>(model.config.n_layers)) {
+    throw std::runtime_error("forward: layer count does not match config");
+  }
 }
-// 将一维向量包装为一行矩阵后执行线性层。
-Tensor vector_linear(const Tensor& x, const Tensor& weight) {
-  Tensor row = x.reshape({1, x.shape[0]});
-  return linear(row, weight).reshape({weight.shape[0]});
+
+// 取出 token 对应的嵌入向量,量化权重时只反量化这一行。
+Tensor Embedding(const Model& model, int token) {
+  Tensor vector({model.config.dim});
+  DequantizeRow(model.token_embedding, token, vector.data.data());
+  return vector;
 }
-// 写入当前 K/V，并计算当前位置可见范围内的 causal attention。
-Tensor attention(Context& ctx, const Model& m, const Tensor& q, const Tensor& k,
-                 const Tensor& v, int layer) {
-  // 只对当前位置及之前的位置计算分数，形成 causal attention。
-  ctx.cache.write(layer, ctx.position, k, v);
-  Tensor output({m.config.dim});
-  const int heads = m.config.n_heads, hd = m.config.head_dim();
-  for (int h = 0; h < heads; ++h) {
-    std::vector<float> scores(ctx.position + 1);
-    for (int t = 0; t <= ctx.position; ++t) {
-      const float* kp = ctx.cache.key_ptr(layer, t, h);
-      for (int d = 0; d < hd; ++d) scores[t] += q.at2(h, d) * kp[d];
-      scores[t] /= std::sqrt(static_cast<float>(hd));
+
+// 加上可选偏置:偏置为空时直接返回原值。
+Tensor AddBias(Tensor value, const Tensor& bias) {
+  if (bias.Size() == 0) {
+    return value;
+  }
+  if (bias.Size() != value.Size()) {
+    throw std::invalid_argument("forward: bias shape mismatch");
+  }
+  for (size_t i = 0; i < value.Size(); ++i) {
+    value.data[i] += bias.data[i];
+  }
+  return value;
+}
+
+// 计算当前位置的因果注意力。
+// 分组查询(GQA)中相邻 group 个 query head 共用一个 key/value head。
+Tensor Attention(Context& context, const Model& model,
+                 const Tensor& q, const Tensor& k, const Tensor& v,
+                 int index) {
+  const ModelConfig& config = model.config;
+  context.cache.Write(index, context.position, k, v);
+
+  const int head_dim = config.head_dim();
+  const int group = config.n_heads / config.n_kv_heads;
+  const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+  const int visible = context.position + 1;
+
+  Tensor output({config.attention_dim()});
+  for (int head = 0; head < config.n_heads; ++head) {
+    const int kv_head = head / group;
+    Tensor scores({visible});
+    for (int t = 0; t < visible; ++t) {
+      const float* key = context.cache.KeyPtr(index, t, kv_head);
+      float dot = 0.0f;
+      for (int i = 0; i < head_dim; ++i) {
+        dot += q.At2(head, i) * key[i];
+      }
+      scores.data[static_cast<size_t>(t)] = dot * scale;
     }
-    Tensor probs({ctx.position + 1});
-    probs.data = scores;
-    probs = softmax(probs);
-    for (int d = 0; d < hd; ++d)
-      for (int t = 0; t <= ctx.position; ++t)
-        output.data[h * hd + d] +=
-            probs.data[t] * ctx.cache.value_ptr(layer, t, h)[d];
+
+    const Tensor weights = Softmax(scores);
+    for (int t = 0; t < visible; ++t) {
+      const float* value = context.cache.ValuePtr(index, t, kv_head);
+      const float weight = weights.data[static_cast<size_t>(t)];
+      for (int i = 0; i < head_dim; ++i) {
+        output.data[static_cast<size_t>(head * head_dim + i)] +=
+            weight * value[i];
+      }
+    }
   }
   return output;
 }
+
+// 计算 SwiGLU 前馈网络:SwiGlu(w_gate * h, w_up * h) * w_down。
+Tensor FeedForward(const LayerWeights& layer, const Tensor& hidden) {
+  const Tensor gate = Linear(hidden, layer.w_gate);
+  const Tensor up = Linear(hidden, layer.w_up);
+  return Linear(SwiGlu(gate, up), layer.w_down);
+}
+
+// 完成一层的注意力子层和前馈子层,含两条残差连接。
+Tensor ForwardLayer(Context& context, const Model& model,
+                    const LayerWeights& layer, const Tensor& hidden,
+                    int index) {
+  const ModelConfig& config = model.config;
+  const int head_dim = config.head_dim();
+
+  const Tensor norm = RmsNorm(hidden, layer.attention_norm,
+                              config.rms_norm_eps);
+  Tensor q = AddBias(Linear(norm, layer.wq), layer.bq)
+                 .Reshape({config.n_heads, head_dim});
+  Tensor k = AddBias(Linear(norm, layer.wk), layer.bk)
+                 .Reshape({config.n_kv_heads, head_dim});
+  Tensor v = AddBias(Linear(norm, layer.wv), layer.bv)
+                 .Reshape({config.n_kv_heads, head_dim});
+  Rope(q, k, context.position, config.rope_theta, config.rope_type);
+
+  const Tensor attention = Attention(context, model, q, k, v, index);
+  const Tensor result = Add(hidden, Linear(attention, layer.wo));
+
+  const Tensor ffn_norm = RmsNorm(result, layer.ffn_norm, config.rms_norm_eps);
+  return Add(result, FeedForward(layer, ffn_norm));
+}
+
+// 最终归一化后做输出投影,得到词表 logits。
+Tensor ComputeLogits(const Model& model, const Tensor& hidden) {
+  const Tensor norm =
+      RmsNorm(hidden, model.final_norm, model.config.rms_norm_eps);
+  return Linear(norm, model.OutputWeight());
+}
+
 }  // namespace
-// 执行一个 token 的完整 Transformer 前向并返回 logits。
-Tensor forward_token(Context& ctx, const Model& model, int token) {
-  if (ctx.position >= model.config.max_seq_len)
-    throw std::runtime_error("context length exceeded");
-  // 依次执行每个 Transformer block，并在 block 内保存 KV cache。
-  Tensor hidden = embedding(model, token);
+
+Tensor ForwardToken(Context& context, const Model& model, int token) {
+  ValidateInputs(context, model, token);
+
+  Tensor hidden = Embedding(model, token);
   for (int layer = 0; layer < model.config.n_layers; ++layer) {
-    const auto& w = model.layers[layer];
-    Tensor norm = rms_norm(hidden, w.attention_norm, model.config.rms_norm_eps);
-    Tensor q = vector_linear(norm, w.wq)
-                   .reshape({model.config.n_heads, model.config.head_dim()});
-    Tensor k = vector_linear(norm, w.wk)
-                   .reshape({model.config.n_kv_heads, model.config.head_dim()});
-    Tensor v = vector_linear(norm, w.wv)
-                   .reshape({model.config.n_kv_heads, model.config.head_dim()});
-    rope(q, k, ctx.position, model.config.rope_theta);
-    Tensor attn = vector_linear(attention(ctx, model, q, k, v, layer), w.wo);
-    hidden = add(hidden, attn);
-    Tensor ff_norm = rms_norm(hidden, w.ffn_norm, model.config.rms_norm_eps);
-    Tensor ff = vector_linear(swiglu(vector_linear(ff_norm, w.w_gate),
-                                     vector_linear(ff_norm, w.w_up)),
-                              w.w_down);
-    hidden = add(hidden, ff);
+    hidden = ForwardLayer(context, model, model.layers[layer], hidden, layer);
   }
-  Tensor logits = vector_linear(
-      rms_norm(hidden, model.final_norm, model.config.rms_norm_eps),
-      model.lm_head);
-  ++ctx.position;
+
+  const Tensor logits = ComputeLogits(model, hidden);
+  ++context.position;
   return logits;
 }
+
 }  // namespace mini_lla

@@ -7,22 +7,27 @@
 
 namespace mini_lla {
 
-// 描述生成时的温度、候选数量和随机种子。
+// 采样参数:温度、top-k 候选数和随机种子。
 struct SamplingParams {
-  float temperature = 0.0f;
-  int top_k = 0;
-  unsigned int seed = 0;
+  float temperature = 0.0f;  // 0 表示贪心
+  int top_k = 0;             // 0 表示不截断候选
+  unsigned int seed = 0;     // 0 表示每次使用随机种子
 };
 
-// 根据 logits 选择下一个 token，温度为零时使用 greedy。
+// 根据 logits 选择下一个 token,支持贪心、温度和 top-k 采样。
 class Sampler {
  public:
-  // 使用指定参数创建采样器。
+  // 使用给定参数创建采样器,并初始化随机数发生器。
   explicit Sampler(const SamplingParams& params);
-  // 按参数从 logits 中选择 token id。
-  int sample(const Tensor& logits);
+
+  // 从 logits 中采样一个 token id。
+  int Sample(const Tensor& logits);
 
  private:
+  // 对候选集合做多项式采样,temperature 为 0 时取最大值。
+  int SampleFromCandidates(
+      const std::vector<std::pair<float, int>>& candidates);
+
   SamplingParams params_;
   std::mt19937 generator_;
 };
