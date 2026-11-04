@@ -48,6 +48,19 @@ def main():
     code, output = run(["inspect", "--model", "models/tiny"])
     failures += check("inspect 打印配置", code == 0 and "n_layers" in output)
 
+    code, output = run(["bench", "--model", "models/tiny", "-n", "2",
+                        "--threads", "2"])
+    failures += check("bench 正常返回", code == 0)
+    failures += check("bench 打印吞吐", "tokens/s" in output)
+    failures += check("bench 使用 2 个线程", "threads: 2" in output)
+
+    code, output = run(["--cuda-info"])
+    failures += check("cuda-info 正常返回", code == 0)
+    failures += check("cuda-info 说明 CUDA 状态", "CUDA" in output)
+
+    code, output = run(["generate", "--model", "models/tiny", "--backend", "cuda"])
+    failures += check("未启用 CUDA 时请求 cuda 后端被拒绝", code != 0)
+
     print("failures=%d" % failures)
     return 1 if failures else 0
 

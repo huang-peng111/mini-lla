@@ -6,13 +6,18 @@
 #include <string>
 #include <vector>
 
+#include "mini_llama/backend.h"
 #include "mini_llama/batch.h"
+#include "mini_llama/benchmark.h"
 #include "mini_llama/chat.h"
+#include "mini_llama/cuda_runtime.h"
+#include "mini_llama/cuda_weights.h"
 #include "mini_llama/forward.h"
 #include "mini_llama/gguf.h"
 #include "mini_llama/loader.h"
 #include "mini_llama/prompt_builder.h"
 #include "mini_llama/sampler.h"
+#include "mini_llama/thread_pool.h"
 #include "mini_llama/tokenizer.h"
 
 namespace mini_lla {
@@ -26,6 +31,9 @@ struct Options {
   std::string chat_template;  // 空串表示按模型自动选择
   int n_predict = 8;
   int context_length = 0;  // 0 表示使用模型自带长度
+  int threads = 0;         // 0 表示使用硬件线程数
+  bool verbose = false;
+  BackendConfig backend;
   SamplingParams sampling;
 };
 
@@ -36,22 +44,24 @@ void PrintUsage(const char* program) {
       << "commands:\n"
       << "  generate        one-shot text generation\n"
       << "  run             interactive multi-turn chat\n"
+      << "  bench           measure prefill and decode speed\n"
       << "  inspect         show model config and weight statistics\n"
       << "  inspect-gguf    show GGUF metadata and tensor table\n"
-      << "usage examples:\n"
-      << "  " << program << " generate --model models/tiny -p hello -n 8\n"
-      << "  " << program << " run models/tiny --temperature 0.8 --top-k 8\n"
-      << "  " << program << " inspect-gguf path/to/model.gguf\n"
+      << "  --cuda-info     print CUDA device information\n"
       << "options:\n"
       << "  --model <path>       tiny directory or GGUF file "
          "(default: models/tiny)\n"
-      << "  -p, --prompt <text>  prompt for generate (default: hello)\n"
+      << "  -p, --prompt <text>  prompt for generate/bench (default: hello)\n"
       << "  -n, --n-predict <n>  tokens to generate (default: 8)\n"
       << "  --ctx <n>            override the context length\n"
+      << "  --threads <n>        CPU worker threads, 0 means auto\n"
+      << "  --backend cpu|cuda   execution backend (default: cpu)\n"
+      << "  --device <n>         CUDA device index (default: 0)\n"
       << "  --temperature <t>    sampling temperature, 0 means greedy\n"
       << "  --top-k <k>          top-k candidates, 0 means no limit\n"
       << "  --seed <s>           random seed, 0 means random\n"
-      << "  --template <name>    chat template: qwen2 or plain\n";
+      << "  --template <name>    chat template: qwen2 or plain\n"
+      << "  --verbose            print per-step logits during bench\n";
 }
 
 // 取出选项后面紧跟的值,缺失时抛出异常。
@@ -117,6 +127,18 @@ Options ParseOptions(int argc, char** argv) {
     } else if (argument == "--ctx") {
       options.context_length =
           ParseInt(NextValue(argc, argv, &i, argument), "--ctx", 1, 65536);
+    } else if (argument == "--threads") {
+      options.threads =
+          ParseInt(NextValue(argc, argv, &i, argument), "--threads", 0, 256);
+    } else if (argument == "--backend") {
+      const std::string value = NextValue(argc, argv, &i, argument);
+      if (!ParseBackend(value, &options.backend.kind)) {
+        throw std::invalid_argument("--backend must be cpu or cuda");
+      }
+    } else if (argument == "--device") {
+      options.backend.device =
+          ParseInt(NextValue(argc, argv, &i, argument), "--device", 0, 64);
+      options.backend.device_set = true;
     } else if (argument == "--temperature") {
       options.sampling.temperature =
           ParseFloat(NextValue(argc, argv, &i, argument), "--temperature", 0.0f,
@@ -129,6 +151,8 @@ Options ParseOptions(int argc, char** argv) {
           ParseInt(NextValue(argc, argv, &i, argument), "--seed", 0, INT_MAX));
     } else if (argument == "--template") {
       options.chat_template = NextValue(argc, argv, &i, argument);
+    } else if (argument == "--verbose") {
+      options.verbose = true;
     } else if (argument == "-h" || argument == "--help") {
       options.command = "help";
     } else if (argument[0] != '-') {
@@ -147,8 +171,28 @@ void ApplyContextLength(Model* model, int requested) {
   if (requested > 0) model->config.max_seq_len = requested;
 }
 
-// 逐 token 生成,解码成文本后流式打印。
-// 返回生成的 token 数量。
+// 校验后端、设置线程数,并在需要时把权重上传到 GPU。
+void PrepareModel(Model* model, const Options& options) {
+  ValidateBackend(options.backend);
+  SetThreadCount(options.threads);
+  if (options.backend.kind == BackendKind::kCuda) {
+    UploadModelWeights(model, options.backend.device);
+  }
+}
+
+// 打印后端、线程数和权重概况。
+void PrintModelSummary(const Model& model, const Options& options) {
+  std::cout << "model: " << options.model << "\n"
+            << "backend: " << BackendName(options.backend.kind) << "\n"
+            << "threads: " << ThreadCount() << "\n"
+            << "weight bytes: " << model.WeightBytes() << "\n";
+  if (options.backend.kind == BackendKind::kCuda) {
+    std::cout << "gpu weight bytes: " << CudaWeightBytes(model)
+              << " (" << CudaWeightCount(model) << " tensors)\n";
+  }
+}
+
+// 逐 token 生成,把解码结果流式打印;返回生成的 token 数。
 int GenerateTokens(const Options& options, const Model& model,
                    ITokenizer& tokenizer, Context& context, Tensor logits,
                    int limit) {
@@ -173,11 +217,12 @@ int GenerateTokens(const Options& options, const Model& model,
   return static_cast<int>(generated.size());
 }
 
-// generate 子命令:一次性完成 prompt 编码、prefill 和生成。
+// generate 子命令:编码 prompt、prefill,然后生成。
 int RunGenerate(const Options& options) {
   LoadedModel loaded = LoadModelAndTokenizer(options.model);
   Model& model = loaded.model;
   ApplyContextLength(&model, options.context_length);
+  PrepareModel(&model, options);
   ITokenizer& tokenizer = *loaded.tokenizer;
 
   const std::vector<int> tokens = tokenizer.Encode(options.prompt);
@@ -188,11 +233,11 @@ int RunGenerate(const Options& options) {
   const int room = model.config.max_seq_len - static_cast<int>(tokens.size());
   const int limit = std::min(options.n_predict, room);
 
+  PrintModelSummary(model, options);
   Context context(model.config);
   const Tensor logits = ForwardBatch(context, model,
                                      MiniBatch::FromTokens(tokens, 0));
-  std::cout << "model: " << options.model << "\n"
-            << "prompt tokens: " << tokens.size() << "\n"
+  std::cout << "prompt tokens: " << tokens.size() << "\n"
             << "output: " << options.prompt;
   GenerateTokens(options, model, tokenizer, context, logits, limit);
   return 0;
@@ -203,6 +248,7 @@ int RunChat(const Options& options) {
   LoadedModel loaded = LoadModelAndTokenizer(options.model);
   Model& model = loaded.model;
   ApplyContextLength(&model, options.context_length);
+  PrepareModel(&model, options);
   ITokenizer& tokenizer = *loaded.tokenizer;
 
   const std::string chat_template = options.chat_template.empty()
@@ -213,10 +259,9 @@ int RunChat(const Options& options) {
     session.AddMessage("system", "You are a helpful assistant.");
   }
 
-  std::cout << "mini-lla chat (model=" << options.model
-            << ", template=" << (chat_template.empty() ? "plain" : chat_template)
-            << ")\n"
-            << "commands: /help /clear /exit\n";
+  PrintModelSummary(model, options);
+  std::cout << "template: " << (chat_template.empty() ? "plain" : chat_template)
+            << "\ncommands: /help /clear /exit\n";
 
   std::string input;
   while (true) {
@@ -258,10 +303,29 @@ int RunChat(const Options& options) {
   return 0;
 }
 
+// bench 子命令:测量 prefill 与 decode 的耗时和吞吐。
+int RunBench(const Options& options) {
+  LoadedModel loaded = LoadModelAndTokenizer(options.model);
+  Model& model = loaded.model;
+  ApplyContextLength(&model, options.context_length);
+  PrepareModel(&model, options);
+
+  PrintModelSummary(model, options);
+  std::cout << "benchmark:\n";
+  const BenchmarkResult result =
+      RunBenchmark(model, *loaded.tokenizer, options.prompt, options.n_predict,
+                   options.sampling, options.verbose);
+  PrintBenchmark(result);
+  return 0;
+}
+
 // inspect 子命令:打印模型配置和权重统计。
-int RunInspect(const std::string& path) {
-  LoadedModel loaded = LoadModelAndTokenizer(path);
-  InspectModel(loaded.model, path);
+int RunInspect(const Options& options) {
+  LoadedModel loaded = LoadModelAndTokenizer(options.model);
+  Model& model = loaded.model;
+  ApplyContextLength(&model, options.context_length);
+  PrepareModel(&model, options);
+  InspectModel(model, options.model);
   return 0;
 }
 
@@ -276,6 +340,21 @@ int RunInspectGguf(const std::string& path) {
   return 0;
 }
 
+// 打印 CUDA 设备信息;CPU-only 构建给出明确提示。
+int RunCudaInfo() {
+  if (!CudaRuntimeBuilt()) {
+    std::cout << "CUDA: 未启用(使用 -DMINI_LLA_CUDA=ON 构建后可用)\n";
+    return 0;
+  }
+  const int count = CudaDeviceCount();
+  std::cout << "CUDA devices: " << count << "\n";
+  for (int device = 0; device < count; ++device) {
+    std::cout << "  " << CudaFormatDeviceInfo(CudaGetDeviceInfo(device))
+              << "\n";
+  }
+  return 0;
+}
+
 }  // namespace
 }  // namespace mini_lla
 
@@ -285,10 +364,12 @@ int main(int argc, char** argv) {
     const Options options = mini_lla::ParseOptions(argc, argv);
     if (options.command == "generate") return mini_lla::RunGenerate(options);
     if (options.command == "run") return mini_lla::RunChat(options);
-    if (options.command == "inspect") return mini_lla::RunInspect(options.model);
+    if (options.command == "bench") return mini_lla::RunBench(options);
+    if (options.command == "inspect") return mini_lla::RunInspect(options);
     if (options.command == "inspect-gguf") {
       return mini_lla::RunInspectGguf(options.model);
     }
+    if (options.command == "--cuda-info") return mini_lla::RunCudaInfo();
     if (options.command == "help" || options.command == "-h" ||
         options.command == "--help") {
       mini_lla::PrintUsage(argv[0]);

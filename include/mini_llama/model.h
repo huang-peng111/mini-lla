@@ -2,6 +2,8 @@
 #define MINI_LLA_INCLUDE_MINI_LLAMA_MODEL_H_
 
 #include <cstddef>
+#include <memory>
+#include <string>
 #include <vector>
 
 #include "mini_llama/ops.h"
@@ -9,6 +11,9 @@
 #include "mini_llama/tensor.h"
 
 namespace mini_lla {
+
+// GPU 权重集合在 cuda_weights.h 中定义,这里只前置声明。
+class CudaModelWeights;
 
 // 模型结构参数,来自 tiny manifest 或 GGUF metadata。
 struct ModelConfig {
@@ -57,6 +62,8 @@ struct Model {
   QuantizedTensor lm_head;          // [vocab_size, dim]
   bool tied_lm_head = false;        // 为 true 时输出投影复用 token_embedding
   std::vector<LayerWeights> layers;
+  // GPU 权重句柄;为空表示纯 CPU 推理。
+  std::shared_ptr<CudaModelWeights> cuda_weights;
 
   // 返回实际使用的输出投影权重。
   const QuantizedTensor& OutputWeight() const;

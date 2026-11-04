@@ -1,6 +1,7 @@
 #ifndef MINI_LLA_INCLUDE_MINI_LLAMA_KV_CACHE_H_
 #define MINI_LLA_INCLUDE_MINI_LLAMA_KV_CACHE_H_
 
+#include "mini_llama/cuda_attention.h"
 #include "mini_llama/model.h"
 #include "mini_llama/tensor.h"
 
@@ -27,6 +28,8 @@ struct KvCache {
 // 一次推理请求的状态:KV cache 与当前正在处理的位置。
 struct Context {
   KvCache cache;
+  // CUDA 后端使用设备上的 KV cache,CPU 后端保持为空。
+  CudaKvCache cuda_cache;
   int position = 0;
 
   // 按模型配置创建缓存,context 长度取 config.max_seq_len。

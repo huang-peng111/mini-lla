@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "mini_llama/ops.h"
+#include "mini_llama/thread_pool.h"
 
 namespace mini_lla {
 namespace {
@@ -210,14 +211,17 @@ Tensor LinearWithBlocks(const Tensor& input, const std::vector<Block>& blocks,
   Tensor output(is_vector ? std::vector<int>{rows}
                           : std::vector<int>{input_rows, rows});
   const int blocks_per_row = (cols + kBlockSize - 1) / kBlockSize;
-  for (int r = 0; r < input_rows; ++r) {
-    const float* source = input.data.data() + static_cast<size_t>(r) * cols;
-    float* destination = output.data.data() + static_cast<size_t>(r) * rows;
-    for (int j = 0; j < rows; ++j) {
+  // 每个输出元素由独立线程计算,互不重叠,结果与串行一致。
+  ParallelFor(input_rows * rows, [&](int begin, int end) {
+    for (int index = begin; index < end; ++index) {
+      const int r = index / rows;
+      const int j = index % rows;
+      const float* source = input.data.data() + static_cast<size_t>(r) * cols;
+      float* destination = output.data.data() + static_cast<size_t>(r) * rows;
       destination[j] = DotQuantizedRow(
           blocks, static_cast<size_t>(j) * blocks_per_row, source, cols);
     }
-  }
+  });
   return output;
 }
 

@@ -4,8 +4,10 @@
 #include <stdexcept>
 #include <vector>
 
+#include "mini_llama/cuda_forward.h"
 #include "mini_llama/ops.h"
 #include "mini_llama/quant.h"
+#include "mini_llama/thread_pool.h"
 
 namespace mini_lla {
 namespace {
@@ -44,6 +46,30 @@ Tensor AddBias(Tensor value, const Tensor& bias) {
   return value;
 }
 
+// 计算一个 query head 在当前可见范围内的注意力结果。
+void AttentionHead(const Context& context, const Tensor& q, int layer,
+                   int head, int kv_head, int head_dim, int visible,
+                   float scale, float* output) {
+  Tensor scores({visible});
+  for (int t = 0; t < visible; ++t) {
+    const float* key = context.cache.KeyPtr(layer, t, kv_head);
+    float dot = 0.0f;
+    for (int i = 0; i < head_dim; ++i) {
+      dot += q.At2(head, i) * key[i];
+    }
+    scores.data[static_cast<size_t>(t)] = dot * scale;
+  }
+
+  const Tensor weights = Softmax(scores);
+  for (int t = 0; t < visible; ++t) {
+    const float* value = context.cache.ValuePtr(layer, t, kv_head);
+    const float weight = weights.data[static_cast<size_t>(t)];
+    for (int i = 0; i < head_dim; ++i) {
+      output[i] += weight * value[i];
+    }
+  }
+}
+
 // 计算当前位置的因果注意力。
 // 分组查询(GQA)中相邻 group 个 query head 共用一个 key/value head。
 Tensor Attention(Context& context, const Model& model,
@@ -58,28 +84,13 @@ Tensor Attention(Context& context, const Model& model,
   const int visible = context.position + 1;
 
   Tensor output({config.attention_dim()});
-  for (int head = 0; head < config.n_heads; ++head) {
-    const int kv_head = head / group;
-    Tensor scores({visible});
-    for (int t = 0; t < visible; ++t) {
-      const float* key = context.cache.KeyPtr(index, t, kv_head);
-      float dot = 0.0f;
-      for (int i = 0; i < head_dim; ++i) {
-        dot += q.At2(head, i) * key[i];
-      }
-      scores.data[static_cast<size_t>(t)] = dot * scale;
+  // 每个 query head 独立计算,可以并行;写回的位置互不重叠。
+  ParallelFor(config.n_heads, [&](int begin, int end) {
+    for (int head = begin; head < end; ++head) {
+      AttentionHead(context, q, index, head, head / group, head_dim, visible,
+                    scale, output.data.data() + head * head_dim);
     }
-
-    const Tensor weights = Softmax(scores);
-    for (int t = 0; t < visible; ++t) {
-      const float* value = context.cache.ValuePtr(index, t, kv_head);
-      const float weight = weights.data[static_cast<size_t>(t)];
-      for (int i = 0; i < head_dim; ++i) {
-        output.data[static_cast<size_t>(head * head_dim + i)] +=
-            weight * value[i];
-      }
-    }
-  }
+  });
   return output;
 }
 
@@ -125,6 +136,9 @@ Tensor ComputeLogits(const Model& model, const Tensor& hidden) {
 
 Tensor ForwardToken(Context& context, const Model& model, int token) {
   ValidateInputs(context, model, token);
+  if (model.cuda_weights != nullptr) {
+    return ForwardTokenCuda(context, model, token);
+  }
 
   Tensor hidden = Embedding(model, token);
   for (int layer = 0; layer < model.config.n_layers; ++layer) {

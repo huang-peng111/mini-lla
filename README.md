@@ -1,103 +1,187 @@
-# mini-lla:从零复刻的 LLaMA 风格推理程序
+# mini-lla
 
-这是按 `IMPLEMENTATION_ROADMAP.md` 逐阶段重写的 C++17 推理程序。当前已完成
-**阶段 0 到阶段 15**:CPU Tiny 模型闭环、GGUF reader/loader/tokenizer、量化
-(Q8_0 / Q4_0 / Q4_1)以及对应的单元测试。
+一个用 **C++17 从零实现**的 LLaMA 风格推理程序,目标是"可读、可测、可解释"。
+不依赖 PyTorch、llama.cpp 或任何第三方推理库,自带最小测试框架与 CLI。
 
-## 代码规范
+当前完成[实施路线](IMPLEMENTATION_ROADMAP.md)的阶段 0–21:CPU Tiny 闭环、
+GGUF 真实模型、字节级 BPE、三种量化格式、CPU 多线程、benchmark,以及可选的
+NVIDIA CUDA 后端。CUDA 路径的代码已完成,但**尚未在真实 GPU 上验证**(见下文)。
 
-- 采用 Google C++ 风格:文件名 `snake_case`、函数与类 `PascalCase`、成员变量
-  带尾下划线、常量 `kPascalCase`、命名空间 `mini_lla`、缩进 2 空格、每行不超过
-  80 列。
-- 每个类和函数都有中文注释,说明它做什么、参数与返回值是什么。
-- 单个函数尽量控制在 40 行以内,复杂流程拆成小函数。
-- 源码是 UTF-8 且包含中文注释,MSVC 编译必须带 `/utf-8`(CMake 已配置)。
+## 项目简介
 
-## 构建与测试
+- **模型格式**:Tiny(JSON manifest + F32 权重)、GGUF v2/v3。
+- **架构**:LLaMA / Qwen2 命名,支持 GQA、RoPE(normal / NeoX)、注意力偏置、
+  tied lm_head。
+- **量化**:F32、Q8_0、Q4_0、Q4_1,block 布局与 ggml 一致,线性层逐 block
+  即时反量化。
+- **文本**:GGUF 内嵌词表的字节级 BPE,支持 merges、特殊 token 与字节回退;
+  内置 Qwen2 与通用聊天模板。
+- **执行**:CPU 多线程、可选 CUDA(F32 cuBLAS + 量化 GEMV + GPU 算子 + GPU KV cache)。
+- **工程**:13 组单元测试 + 1 个 CLI 冒烟测试,`/W4` 零警告。
+
+## 架构与数据流
+
+```text
+CLI(main.cc)
+  ├─ loader.cc          目录 → Tiny;文件 → GGUF
+  ├─ gguf_tokenizer.cc  字节级 BPE
+  ├─ backend.cc         CPU / CUDA 选择与校验
+  └─ forward.cc
+       ├─ CPU:ops.cc + matmul_optimized.cc + quant.cc(线程池并行)
+       └─ CUDA:cuda_forward.cc → cuda_matmul / cuda_ops / cuda_attention
+  → sampler.cc → tokenizer.Decode → 终端输出
+```
+
+一次 `generate` 的路径:
+
+```text
+prompt → tokenizer.Encode → MiniBatch::FromTokens → ForwardBatch(prefill)
+       → Sampler.Sample → ForwardToken(decode) → Decode → 增量打印
+```
+
+## 快速开始
+
+CPU 构建(默认,不需要 CUDA Toolkit):
 
 ```powershell
 cmake -S . -B build
 cmake --build build --config Debug
 ctest --test-dir build -C Debug --output-on-failure
-```
 
-`ctest` 会运行两个测试:自带 runner 的 C++ 单元测试,以及一份 Python CLI 冒烟
-测试(需要 Python 3,找不到时会自动跳过)。
+.\build\Debug\mini-lla.exe generate --model models\tiny -p "hello" -n 8
+.\build\Debug\mini-lla.exe bench models\tiny -n 4 --threads 4
+```
 
 ## 命令
 
+| 命令 | 作用 |
+|---|---|
+| `generate` | 单次生成 |
+| `run` | 多轮终端聊天(`/help` `/clear` `/exit`) |
+| `bench` | prefill / decode 计时与吞吐 |
+| `inspect` | 模型配置与权重统计 |
+| `inspect-gguf` | GGUF metadata 与 tensor 表 |
+| `--cuda-info` | CUDA 设备信息(CPU 构建会说明未启用) |
+
 ```powershell
-# 单次生成(tiny 模型是随机权重,只用于验证链路)
-.\build\Debug\mini-lla.exe generate --model models\tiny -p "hello" -n 8
+# 真实 GGUF 模型(把路径换成你本机的文件)
+.\build\Debug\mini-lla.exe generate model.gguf -p "Hello, my name is" -n 8 --ctx 256 --threads 4
+.\build\Debug\mini-lla.exe run model.gguf -n 32 --ctx 512 --threads 4
+.\build\Debug\mini-lla.exe bench model.gguf -p "Hello" -n 16 --threads 4 --verbose
 
 # 固定种子的温度 / top-k 采样
 .\build\Debug\mini-lla.exe generate --model models\tiny -n 8 --temperature 0.8 --top-k 8 --seed 42
-
-# 多轮聊天,命令:/help /clear /exit
-.\build\Debug\mini-lla.exe run models\tiny --temperature 0.8 --top-k 8 --seed 42
-
-# 查看模型配置和权重统计
-.\build\Debug\mini-lla.exe inspect models\tiny
-
-# 查看 GGUF 的 metadata 与 tensor 表
-.\build\Debug\mini-lla.exe inspect-gguf path\to\model.gguf
-
-# 真实模型:GGUF 路径可以直接传给 generate / run / inspect
-.\build\Debug\mini-lla.exe generate path\to\Qwen2-0.5B-Instruct-Q8_0.gguf -p "Hello, my name is" -n 6 --ctx 256
-.\build\Debug\mini-lla.exe run path\to\Qwen2-0.5B-Instruct-Q8_0.gguf -n 32 --ctx 512
 ```
 
-常用选项:`--model`、`-p/--prompt`、`-n/--n/--n-predict`、`--ctx`、
-`--temperature`、`--top-k`、`--seed`、`--template qwen2|plain`。
-模型路径也可以写成位置参数,例如 `inspect models/tiny`。
-
-## 支持的模型格式
-
-| 项目 | 支持情况 |
+| 选项 | 说明 |
 |---|---|
-| Tiny 格式 | `model.json` + `model.bin`(manifest 记录每个 tensor 的偏移和字节数) |
-| GGUF 版本 | v2 / v3 |
-| GGUF tensor 类型 | F32、Q8_0、Q4_0、Q4_1(与 ggml 的 block 布局一致) |
-| 架构 | LLaMA / Qwen2 命名(`blk.N.*`),Qwen2 使用 NeoX 风格 RoPE |
-| 分组查询注意力 | 支持,`n_kv_heads` 小于 `n_heads` 时按组共享 KV |
-| 注意力偏置 | 支持 `attn_q/k/v.bias` |
-| 权重共享 | `output.weight` 缺失时自动与 `token_embd.weight` 共享 |
-| tokenizer | GGUF 内置词表 + merges,字节级 BPE,支持特殊 token 与字节回退 |
-| 聊天模板 | 内置 Qwen2 (`<|im_start|>`)和通用文本模板;任意 Jinja2 模板不支持 |
+| `--model <path>` | Tiny 目录或 GGUF 文件(也可写成位置参数) |
+| `-p, --prompt <text>` | 输入文本,默认 `hello` |
+| `-n, --n-predict <n>` | 生成 token 数,默认 8 |
+| `--ctx <n>` | 覆盖上下文长度(GGUF 默认截到 2048) |
+| `--threads <n>` | CPU 线程数,0 = 硬件线程 |
+| `--backend cpu\|cuda` | 执行后端,默认 cpu |
+| `--device <n>` | CUDA 设备编号 |
+| `--temperature` / `--top-k` / `--seed` | 采样参数 |
+| `--template qwen2\|plain` | 聊天模板 |
+| `--verbose` | bench 时打印每步 top-5 logits |
 
-未支持:F16、K-quants、IQ-quants、多 GPU、SIMD 与多线程(属于阶段 16 之后)。
+## 阶段完成情况
 
-## 已实现的阶段与验证方式
+| 阶段 | 内容 | 状态 |
+|---|---|---|
+| 0–2 | 构建、Tensor、基础算子 | ✅ 已验证 |
+| 3–5 | Tiny loader、tokenizer、KV cache | ✅ 已验证 |
+| 6–8 | Transformer 前向、greedy 生成、文档 | ✅ 已验证 |
+| 9–10 | prefill/decode 统一、采样、多轮聊天 | ✅ 已验证 |
+| 11–13 | GGUF reader、模型映射、BPE tokenizer | ✅ 已验证(真实 Qwen2-0.5B) |
+| 14–15 | Q8_0 / Q4_0 / Q4_1 量化 | ✅ 已验证 |
+| 16 | CPU 线程池 | ✅ 已验证(数值一致,真实模型约 3× 加速) |
+| 17 | Benchmark | ✅ 已验证 |
+| 18–20 | CUDA 后端 | ⚠️ 代码完成,未在 GPU 上编译运行 |
+| 21 | 文档、功能对照、CLI 冒烟 | ✅ 已完成 |
 
-- 阶段 1–2:张量与算子 —— `test_tensor.cc`、`test_ops.cc`。
-- 阶段 3:tiny manifest 与权重加载 —— `test_loader.cc`,校验形状与字节数。
-- 阶段 4:tokenizer —— `test_tokenizer.cc`。
-- 阶段 5:KV cache —— `test_kv_cache.cc`。
-- 阶段 6–7:单 token 前向与贪心生成 —— `test_forward.cc`、CLI 冒烟测试。
-- 阶段 9:prefill / decode 统一输入 —— `MiniBatch`,批量与逐 token 结果一致。
-- 阶段 10:多轮聊天 —— `test_sampler_chat.cc` 与 `run` 命令。
-- 阶段 11:GGUF reader —— `test_gguf.cc`(含 magic / 版本 / 截断错误路径)。
-- 阶段 12:GGUF 映射到模型 —— `test_gguf_loader.cc`,合成 GGUF 跑通前向。
-- 阶段 13:GGUF tokenizer —— `test_tokenizer.cc`;真实模型 `generate -n 1` 冒烟。
-- 阶段 14–15:Q8_0 / Q4_0 / Q4_1 —— `test_quant.cc`,覆盖不对称 block、尾部
-  block、奇偶 nibble 与误差上界。
+## 测试
+
+`ctest` 运行两个测试:13 组 C++ 单元测试与 1 个 Python CLI 冒烟测试。
+
+| 测试 | 覆盖内容 |
+|---|---|
+| `test_tensor` | 构造、索引、reshape、越界 |
+| `test_ops` | MatMul/Linear/RMSNorm/Softmax/SwiGLU/RoPE |
+| `test_thread_pool` | 分块唯一性、异常回传、重复调用、1 vs 4 线程一致 |
+| `test_kv_cache` | 读写、层间隔离、越界 |
+| `test_forward` | 单步前向、批量等价、错误路径 |
+| `test_loader` | manifest 校验、截断文件 |
+| `test_tokenizer` | BPE 合并、特殊 token、字节回退、解码 |
+| `test_sampler_chat` | 贪心/温度/top-k、模板拼接 |
+| `test_benchmark` | 计数、计时、空 prompt |
+| `test_quant` | block 布局、不对称 block、尾部 block、误差 |
+| `test_gguf` | v2/v3 解析、metadata、错误文件 |
+| `test_gguf_loader` | 形状映射、GQA、量化类型、前向 |
+| `test_cuda_runtime` | CPU-only 错误路径 / 设备信息 |
+| `cli-smoke` | generate、bench、参数校验、cuda 拒绝、inspect |
+
+## 性能参考
+
+Qwen2-0.5B-Instruct-Q8_0、`--ctx 256`、GTX 1650 机器上的 CPU 路径:
+
+| 线程 | decode 吞吐 | 说明 |
+|---|---|---|
+| 1 | 0.10 token/s | 与 4 线程的 top-5 logits 完全一致 |
+| 4 | 0.30 token/s | 约 3× 加速,数值结果不变 |
+
+Tiny 模型矩阵很小,多线程可能持平或略慢,属于正常现象;量化 GEMV 是主要瓶颈。
+
+## CUDA 构建
+
+```powershell
+cmake -S . -B build-cuda -DMINI_LLA_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=75
+cmake --build build-cuda --config Release
+
+.\build-cuda\Release\mini-lla.exe --cuda-info
+.\build-cuda\Release\mini-lla.exe bench model.gguf -p "Hello" -n 16 --ctx 256 --backend cuda
+```
+
+`75` 对应 GTX 1650;RTX 30 系列用 `86`,40 系列用 `89`。需要 CUDA Toolkit 12.x。
+
+**验证状态说明**:开发机只有驱动(592.82)与 GTX 1650(算力 7.5),没有安装
+CUDA Toolkit,因此 `.cu` 文件从未经过编译器,GPU 路径也从未运行。CPU 构建会编译
+全部 `.cc` 桩,`--backend cuda` 会给出明确错误。启用 CUDA 后建议按以下顺序验证:
+
+1. `--cuda-info` 能否枚举设备;
+2. `inspect --backend cuda` 检查权重上传数量与显存占用;
+3. `bench --verbose --backend cuda` 与 CPU 的 top-5 logits 对照;
+4. 固定 prompt 连续生成,确认 KV cache 复位与边界正确。
 
 ## 已知限制
 
-- 加载 GGUF 时上下文长度按 2048 截断(元数据里常见 32768),用 `--ctx` 调整,
-  这样可以限制 KV cache 的内存占用。
-- 分词只做了"空格 + 单词"的预切分,没有实现 Qwen2 的完整正则预切分,长句
-  标点边界与 llama.cpp 可能有细微差异。
-- 量化线性层是逐 block 即时反量化,没有 SIMD 优化,所以真实模型上每个 token
-  需要数秒;线程池与 SIMD 属于阶段 16。
-- Tiny 模型使用随机权重,只用来验证推理链路,生成内容没有语义。
+- GGUF 上下文长度在加载时截到 2048,可用 `--ctx` 调整(注意 KV cache 内存)。
+- 分词只做"空格 + 单词"的预切分,未实现 Qwen2 的完整正则预切分。
+- 不支持 F16、K-quants、IQ-quants、多 GPU、FlashAttention 与任意 Jinja2 模板。
+- 多轮聊天每轮重新 prefill 完整历史,尚未复用 KV cache。
+- cuBLAS 句柄为进程级静态对象,当前只支持单设备。
 
 ## 目录结构
 
 ```text
-include/mini_llama/   接口:张量、算子、量化、模型、GGUF、tokenizer、聊天
-src/                  实现,与头文件一一对应
-tests/                自带 runner 的单元测试 + GGUF fixture 生成器
-scripts/              tiny 模型导出、CLI 冒烟测试
-models/tiny/          Tiny manifest 与 F32 权重
+include/mini_llama/   27 个头文件:接口与数据布局
+src/                  31 个实现文件,含 3 个 CUDA 内核
+tests/                13 组测试 + GGUF fixture
+scripts/              Tiny 模型导出、CLI 冒烟测试
+models/tiny/          Tiny manifest 与随机权重
 ```
+
+建议阅读顺序:`tensor.h` → `ops.cc` → `loader.cc` → `forward.cc` → `gguf.cc` →
+`gguf_tokenizer.cc` → `quant.cc` → `thread_pool.cc` → `cuda_forward.cc`。
+
+## 代码规范
+
+- Google C++ 风格:文件 `snake_case`、函数与类 `PascalCase`、成员带尾下划线、
+  常量 `kPascalCase`、2 空格缩进、每行不超过 80 列。
+- 每个类和函数都有中文注释;复杂流程拆成小函数。
+- 源码为 UTF-8,MSVC 必须加 `/utf-8`(CMake 已配置)。
+
+## 许可
+
+仓库目前尚未添加 `LICENSE` 文件;如需开源发布,请先补充许可证(例如 MIT)。

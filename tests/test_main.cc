@@ -12,6 +12,9 @@ void TestSamplerChat();
 void TestQuant();
 void TestGguf();
 void TestGgufLoader();
+void TestThreadPool();
+void TestBenchmark();
+void TestCudaRuntime();
 
 // 依次运行全部测试,统计失败数量并返回对应状态码。
 int main() {
@@ -24,6 +27,8 @@ int main() {
       {"loader", TestLoader},           {"tokenizer", TestTokenizer},
       {"sampler_chat", TestSamplerChat}, {"quant", TestQuant},
       {"gguf", TestGguf},               {"gguf_loader", TestGgufLoader},
+      {"thread_pool", TestThreadPool},  {"benchmark", TestBenchmark},
+      {"cuda_runtime", TestCudaRuntime},
   };
 
   int failed = 0;

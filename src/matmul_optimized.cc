@@ -2,6 +2,8 @@
 
 #include <stdexcept>
 
+#include "mini_llama/thread_pool.h"
+
 namespace mini_lla {
 namespace {
 
@@ -52,14 +54,17 @@ Tensor MatmulNaive(const Tensor& a, const Tensor& b) {
 Tensor MatmulOptimized(const Tensor& a, const Tensor& b) {
   CheckMatmulShapes(a, b);
   Tensor output({a.shape[0], b.shape[1]});
-  for (int row = 0; row < a.shape[0]; ++row) {
-    for (int inner = 0; inner < a.shape[1]; ++inner) {
-      const float value = a.At2(row, inner);
-      for (int column = 0; column < b.shape[1]; ++column) {
-        output.At2(row, column) += value * b.At2(inner, column);
+  // 每个线程负责若干输出行,行之间互不重叠,结果与串行一致。
+  ParallelFor(a.shape[0], [&](int begin, int end) {
+    for (int row = begin; row < end; ++row) {
+      for (int inner = 0; inner < a.shape[1]; ++inner) {
+        const float value = a.At2(row, inner);
+        for (int column = 0; column < b.shape[1]; ++column) {
+          output.At2(row, column) += value * b.At2(inner, column);
+        }
       }
     }
-  }
+  });
   return output;
 }
 
@@ -85,21 +90,24 @@ Tensor LinearOptimized(const Tensor& x, const Tensor& weight) {
   const int rows = CheckLinearShapes(x, weight);
   const bool is_vector = x.Rank() == 1;
   const int in_features = weight.shape[1];
+  const int out_features = weight.shape[0];
   Tensor output(is_vector ? std::vector<int>{weight.shape[0]}
                           : std::vector<int>{rows, weight.shape[0]});
-  for (int row = 0; row < rows; ++row) {
-    const float* source = x.data.data() + static_cast<size_t>(row) * in_features;
-    float* destination =
-        output.data.data() + static_cast<size_t>(row) * weight.shape[0];
-    for (int out = 0; out < weight.shape[0]; ++out) {
+  // 按输出元素切分任务,每个元素只由一个线程计算。
+  ParallelFor(rows * out_features, [&](int begin, int end) {
+    for (int index = begin; index < end; ++index) {
+      const int row = index / out_features;
+      const int out = index % out_features;
+      const float* source =
+          x.data.data() + static_cast<size_t>(row) * in_features;
       const float* filters = weight.RowPtr(out);
       float sum = 0.0f;
       for (int k = 0; k < in_features; ++k) {
         sum += source[k] * filters[k];
       }
-      destination[out] = sum;
+      output.data[static_cast<size_t>(row) * out_features + out] = sum;
     }
-  }
+  });
   return output;
 }
 
