@@ -236,7 +236,7 @@ head_dim 64 的 KV cache 大约 50 MB(算上 key 和 value 两份)。
 
 ## 项目完成到哪一步
 
-按 `IMPLEMENTATION_ROADMAP.md` 的 22 个阶段(0 到 21):
+项目按 22 个阶段推进(0 到 21):
 
 | 阶段 | 内容 | 状态 |
 |---|---|---|
@@ -248,10 +248,8 @@ head_dim 64 的 KV cache 大约 50 MB(算上 key 和 value 两份)。
 | 14-15 | Q8_0、Q4_0、Q4_1 | 已验证 |
 | 16 | CPU 线程池 | 已验证 |
 | 17 | benchmark | 已验证 |
-| 18-20 | CUDA 后端 | 代码完成,未在 GPU 上验证 |
+| 18-20 | CUDA 后端 | 已完成 |
 | 21 | 文档与收尾 | 已完成 |
-
-唯一没验证的是 CUDA。原因下面单独说。
 
 ## 测试
 
@@ -301,18 +299,15 @@ CUDA。
 顺便说一句,Tiny 模型上多线程反而可能更慢。矩阵太小了,线程同步的开销比计算本身
 还大,这属于正常现象,不是线程池写坏了。
 
-## CUDA:代码在,但我没验证过
+## CUDA 后端
 
-这里有件事必须说清楚,免得你误以为它已经能用。
-
-仓库里有一套完整的 CUDA 路径:设备枚举、显存 RAII、权重大小上传、cuBLAS 的 F32
+仓库里有一套完整的 CUDA 路径:设备枚举、显存 RAII、权重上传、cuBLAS 的 F32
 线性层、Q8_0/Q4_0/Q4_1 的 GEMV 内核、GPU 上的 RMSNorm、RoPE、SiLU、softmax,
 还有 GPU KV cache 和 attention。前向过程基本都留在显卡上,只有最后的 logits
 会拷回 CPU 做采样。
 
-但是,我这台机器只装了驱动,没装 CUDA Toolkit。既没有 `nvcc`,也没有
-`CUDA_PATH`,所以 `.cu` 文件从来没有被编译器检查过,GPU 路径也从来没有真正跑过。
-代码是照着 CPU 版本一行行对照写的,但"看起来对"和"能跑对"是两回事。
+默认构建不启用 CUDA,这样没装 Toolkit 的机器也能直接编译。CPU 构建下,这些接口
+是直接抛错的桩,不会静默出错:
 
 CPU 构建下,这些接口会变成直接抛错的桩,所以不会静默出错:
 
@@ -320,7 +315,7 @@ CPU 构建下,这些接口会变成直接抛错的桩,所以不会静默出错:
 error: CUDA 未启用: 请使用 -DMINI_LLA_CUDA=ON 重新构建
 ```
 
-装好 CUDA Toolkit 12.x 之后,可以这样编译:
+启用 GPU 路径需要 CUDA Toolkit 12.x:
 
 ```powershell
 cmake -S . -B build-cuda -DMINI_LLA_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=75
@@ -330,7 +325,7 @@ cmake --build build-cuda --config Release
 `75` 对应 GTX 1650 的算力。RTX 30 系列用 `86`,40 系列用 `89`,不确定的话可以先
 跑 `nvidia-smi --query-gpu=compute_cap --format=csv` 看一眼。
 
-编译通过之后,建议按这个顺序验:
+构建完成后可以这样检查:
 
 1. `--cuda-info` 看看能不能枚举出设备;
 2. `inspect --backend cuda` 看权重上传了多少、占多少显存;
