@@ -3,9 +3,7 @@
 一个用 **C++17 从零实现**的 LLaMA 风格推理程序,目标是"可读、可测、可解释"。
 不依赖 PyTorch、llama.cpp 或任何第三方推理库,自带最小测试框架与 CLI。
 
-当前完成[实施路线](IMPLEMENTATION_ROADMAP.md)的阶段 0–21:CPU Tiny 闭环、
-GGUF 真实模型、字节级 BPE、三种量化格式、CPU 多线程、benchmark,以及可选的
-NVIDIA CUDA 后端。CUDA 路径的代码已完成,但**尚未在真实 GPU 上验证**(见下文)。
+当前完成CPU Tiny 闭环、GGUF 真实模型、字节级 BPE、三种量化格式、CPU 多线程、benchmark。
 
 ## 项目简介
 
