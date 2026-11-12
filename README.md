@@ -84,21 +84,6 @@ ctest --test-dir build -C Debug --output-on-failure
 | `--template qwen2\|plain` | 聊天模板 |
 | `--verbose` | bench 时打印每步 top-5 logits |
 
-## 阶段完成情况
-
-| 阶段 | 内容 | 状态 |
-|---|---|---|
-| 0–2 | 构建、Tensor、基础算子 | ✅ 已验证 |
-| 3–5 | Tiny loader、tokenizer、KV cache | ✅ 已验证 |
-| 6–8 | Transformer 前向、greedy 生成、文档 | ✅ 已验证 |
-| 9–10 | prefill/decode 统一、采样、多轮聊天 | ✅ 已验证 |
-| 11–13 | GGUF reader、模型映射、BPE tokenizer | ✅ 已验证(真实 Qwen2-0.5B) |
-| 14–15 | Q8_0 / Q4_0 / Q4_1 量化 | ✅ 已验证 |
-| 16 | CPU 线程池 | ✅ 已验证(数值一致,真实模型约 3× 加速) |
-| 17 | Benchmark | ✅ 已验证 |
-| 18–20 | CUDA 后端 | ✅ 代码完成,未在 GPU 上编译运行 |
-| 21 | 文档、功能对照、CLI 冒烟 | ✅ 已完成 |
-
 ## 测试
 
 `ctest` 运行两个测试:13 组 C++ 单元测试与 1 个 Python CLI 冒烟测试。
